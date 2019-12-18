@@ -32,6 +32,7 @@ from ..utils.validation import FLOAT_DTYPES
 from ..exceptions import ConvergenceWarning
 from . import _k_means_fast as _k_means
 from ._k_means_elkan import k_means_elkan
+from ._k_means_yinyang import k_means_yinyang
 
 
 ###############################################################################
@@ -178,7 +179,8 @@ def _check_normalize_sample_weight(sample_weight, X):
 def k_means(X, n_clusters, sample_weight=None, init='k-means++',
             precompute_distances='auto', n_init=10, max_iter=300,
             verbose=False, tol=1e-4, random_state=None, copy_x=True,
-            n_jobs=None, algorithm="auto", return_n_iter=False):
+            n_jobs=None, algorithm="auto", return_n_iter=False,
+            maxmem=None):
     """K-means clustering algorithm.
 
     Read more in the :ref:`User Guide <k_means>`.
@@ -270,6 +272,11 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
     return_n_iter : bool, optional
         Whether or not to return the number of iterations.
 
+    maxmem : string, optional (default=None)
+        The amount of memory yinyang k-means is allowed to use. Ignored if the 
+        "algorithm" argument is not "yinyang." May be specified in units of B,
+        KB, MB, GB, or TB. Ex: "10GB"
+
     Returns
     -------
     centroid : float ndarray with shape (k, n_features)
@@ -292,7 +299,7 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
         n_clusters=n_clusters, init=init, n_init=n_init, max_iter=max_iter,
         verbose=verbose, precompute_distances=precompute_distances, tol=tol,
         random_state=random_state, copy_x=copy_x, n_jobs=n_jobs,
-        algorithm=algorithm
+        algorithm=algorithm, maxmem=maxmem
     ).fit(X, sample_weight=sample_weight)
     if return_n_iter:
         return est.cluster_centers_, est.labels_, est.inertia_, est.n_iter_
@@ -303,7 +310,7 @@ def k_means(X, n_clusters, sample_weight=None, init='k-means++',
 def _kmeans_single_elkan(X, sample_weight, n_clusters, max_iter=300,
                          init='k-means++', verbose=False, x_squared_norms=None,
                          random_state=None, tol=1e-4,
-                         precompute_distances=True):
+                         precompute_distances=True, maxmem=None):
     if sp.issparse(X):
         raise TypeError("algorithm='elkan' not supported for sparse input X")
     random_state = check_random_state(random_state)
@@ -328,11 +335,35 @@ def _kmeans_single_elkan(X, sample_weight, n_clusters, max_iter=300,
         inertia = np.sum(sq_distances, dtype=np.float64)
     return labels, inertia, centers, n_iter
 
+def _kmeans_single_yinyang(X, sample_weight, n_clusters, max_iter=300,
+                         init='k-means++', verbose=False, x_squared_norms=None,
+                         random_state=None, tol=1e-4,
+                         precompute_distances=True, maxmem=None):
+    if sp.issparse(X):
+        raise TypeError("algorithm='yinyang' not supported for sparse input X")
+    random_state = check_random_state(random_state)
+    if x_squared_norms is None:
+        x_squared_norms = row_norms(X, squared=True)
+    # init
+    centers = _init_centroids(X, n_clusters, init, random_state=random_state,
+                              x_squared_norms=x_squared_norms)
+    centers = np.ascontiguousarray(centers)
+    if verbose:
+        print('Initialization complete')
+
+    checked_sample_weight = _check_normalize_sample_weight(sample_weight, X)
+    centers, labels, n_iter = k_means_yinyang(X, n_clusters, centers, tol=tol,
+                                            max_iter=max_iter, verbose=verbose,
+                                            maxmem=maxmem)
+    if sample_weight is None:
+        inertia = np.sum((X - centers[labels]) ** 2, dtype=np.float64)
+    return labels, inertia, centers, n_iter
+
 
 def _kmeans_single_lloyd(X, sample_weight, n_clusters, max_iter=300,
                          init='k-means++', verbose=False, x_squared_norms=None,
                          random_state=None, tol=1e-4,
-                         precompute_distances=True):
+                         precompute_distances=True, maxmem=None):
     """A single run of k-means, assumes preparation completed prior.
 
     Parameters
@@ -725,6 +756,11 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         inequality, but currently doesn't support sparse data. "auto" chooses
         "elkan" for dense data and "full" for sparse data.
 
+    maxmem : string, optional (default=None)
+        The amount of memory yinyang k-means is allowed to use. Ignored if the 
+        "algorithm" argument is not "yinyang." May be specified in units of B,
+        KB, MB, GB, or TB. Ex: "10GB"
+
     Attributes
     ----------
     cluster_centers_ : array, [n_clusters, n_features]
@@ -792,7 +828,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
     def __init__(self, n_clusters=8, init='k-means++', n_init=10,
                  max_iter=300, tol=1e-4, precompute_distances='auto',
                  verbose=0, random_state=None, copy_x=True,
-                 n_jobs=None, algorithm='auto'):
+                 n_jobs=None, algorithm='auto', maxmem=None):
 
         self.n_clusters = n_clusters
         self.init = init
@@ -805,6 +841,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         self.copy_x = copy_x
         self.n_jobs = n_jobs
         self.algorithm = algorithm
+        self.maxmem = maxmem
 
     def _check_test_data(self, X):
         X = check_array(X, accept_sparse='csr', dtype=FLOAT_DTYPES)
@@ -918,8 +955,10 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
             kmeans_single = _kmeans_single_lloyd
         elif algorithm == "elkan":
             kmeans_single = _kmeans_single_elkan
+        elif algorithm == "yinyang":
+            kmeans_single = _kmeans_single_yinyang
         else:
-            raise ValueError("Algorithm must be 'auto', 'full' or 'elkan', got"
+            raise ValueError("Algorithm must be 'auto', 'full', 'yinyang' or 'elkan', got"
                              " %s" % str(algorithm))
 
         seeds = random_state.randint(np.iinfo(np.int32).max, size=n_init)
@@ -933,7 +972,8 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
                     X, sample_weight, self.n_clusters,
                     max_iter=self.max_iter, init=init, verbose=self.verbose,
                     precompute_distances=precompute_distances, tol=tol,
-                    x_squared_norms=x_squared_norms, random_state=seed)
+                    x_squared_norms=x_squared_norms, random_state=seed,
+                    maxmem=self.maxmem)
                 # determine if these results are the best so far
                 if best_inertia is None or inertia < best_inertia:
                     best_labels = labels.copy()
@@ -950,7 +990,8 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
                     precompute_distances=precompute_distances,
                     x_squared_norms=x_squared_norms,
                     # Change seed to ensure variety
-                    random_state=seed
+                    random_state=seed,
+                    maxmem=self.maxmem
                 )
                 for seed in seeds)
             # Get results with the lowest inertia
